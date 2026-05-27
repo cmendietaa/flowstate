@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --color-background: #f7f8fa;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f0f3f5;
+  --color-ink: #18201d;
+  --color-muted: #66716d;
+  --color-line: #dfe5dd;
+  --color-moss: #567568;
+  --color-coral: #d66f5f;
+  --color-gold: #c99a2e;
+  --color-sky: #5e8fbf;
+  --color-focus: #246bfe;
+  --shadow-soft: 0 14px 40px rgb(24 32 29 / 8%);
+  --shadow-panel: 0 18px 60px rgb(24 32 29 / 10%);
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+}
+
+:root {
+  color-scheme: light;
+  background: var(--color-background);
+  color: var(--color-ink);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, rgb(255 255 255 / 86%) 0%, rgb(247 248 250 / 92%) 36%, #eef2f4 100%),
+    radial-gradient(circle at top left, rgb(94 143 191 / 10%), transparent 34%);
+  font-family: var(--font-sans);
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button:not(:disabled),
+[role="button"]:not(:disabled) {
+  cursor: pointer;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: rgb(94 143 191 / 24%);
+}
