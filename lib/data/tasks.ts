@@ -7,7 +7,7 @@ export interface DashboardSeedData {
   calendarBlocks: CalendarBlock[];
   integrationStatus: {
     supabase: "connected" | "seeded";
-    googleCalendar: "connected" | "not_connected";
+    googleCalendar: "connected" | "not_connected" | "error";
   };
 }
 

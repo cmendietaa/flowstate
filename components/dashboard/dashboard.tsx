@@ -15,9 +15,11 @@ import {
   Inbox,
   LayoutDashboard,
   ListChecks,
+  LogIn,
   MoreHorizontal,
   Percent,
   Plus,
+  RefreshCw,
   Search,
   SlidersHorizontal,
   Settings,
@@ -60,6 +62,7 @@ import {
   weightLabelToValue
 } from "@/lib/priority";
 import { parseTaskResponseSchema } from "@/lib/schemas/task";
+import { supabase } from "@/lib/supabase";
 import type {
   CalendarBlock,
   Course,
@@ -72,19 +75,58 @@ import type { DashboardSeedData } from "@/lib/data/tasks";
 import { cn } from "@/lib/utils";
 
 const fallbackCourseId = "inbox";
+type DashboardView = "today" | "tasks" | "calendar" | "courses" | "settings";
+
 const navItems = [
-  { label: "Today", icon: LayoutDashboard },
-  { label: "Tasks", icon: ListChecks },
-  { label: "Calendar", icon: CalendarDays },
-  { label: "Courses", icon: Inbox },
-  { label: "Settings", icon: Settings }
-];
+  { value: "today", label: "Today", icon: LayoutDashboard },
+  { value: "tasks", label: "Tasks", icon: ListChecks },
+  { value: "calendar", label: "Calendar", icon: CalendarDays },
+  { value: "courses", label: "Courses", icon: Inbox },
+  { value: "settings", label: "Settings", icon: Settings }
+] satisfies { value: DashboardView; label: string; icon: typeof LayoutDashboard }[];
+
+const googleCalendarScopes =
+  "openid email profile https://www.googleapis.com/auth/calendar";
+
+const viewTitles = {
+  today: "Today's academic priorities",
+  tasks: "Task queue",
+  calendar: "Calendar sync",
+  courses: "Courses",
+  settings: "Settings"
+} satisfies Record<DashboardView, string>;
+
+const viewSubtitles = {
+  today: "One screen for the next best move.",
+  tasks: "Filter, adjust, and complete your ranked workload.",
+  calendar: "Google Calendar blocks and FlowState deadlines together.",
+  courses: "Course workload at a glance.",
+  settings: "Auth, data, and calendar connection status."
+} satisfies Record<DashboardView, string>;
+
+const calendarStatusText = {
+  connected: "Connected",
+  not_connected: "Not connected",
+  error: "Sync issue"
+} satisfies Record<
+  DashboardSeedData["integrationStatus"]["googleCalendar"],
+  string
+>;
 
 export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
   const [tasks, setTasks] = useState(seedData.tasks);
+  const [courses, setCourses] = useState(seedData.courses);
+  const [calendarBlocks, setCalendarBlocks] = useState(seedData.calendarBlocks);
+  const [integrationStatus, setIntegrationStatus] = useState(
+    seedData.integrationStatus
+  );
+  const [activeView, setActiveView] = useState<DashboardView>("today");
   const [selectedCourseId, setSelectedCourseId] = useState("all");
   const [activeTab, setActiveTab] = useState("all");
   const [isCommandOpen, setIsCommandOpen] = useState(false);
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [parserState, setParserState] = useState<{
     confidence: ParserConfidence;
     message: string;
@@ -114,7 +156,7 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
   }, [activeTab, rankedTasks, selectedCourseId, tasks]);
 
   const focusTask = visibleTasks[0] ?? rankedTasks[0];
-  const todayBlocks = seedData.calendarBlocks.filter((block) =>
+  const todayBlocks = calendarBlocks.filter((block) =>
     isSameDay(parseISO(block.start), new Date())
   );
   const openTasks = tasks.filter((task) => !task.is_completed);
@@ -138,17 +180,276 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  useEffect(() => {
+    if (!supabase) {
+      return;
+    }
+
+    let isMounted = true;
+
+    async function hydrateFromSupabase() {
+      const { data } = await supabase!.auth.getSession();
+      const session = data.session;
+
+      if (!isMounted || !session) {
+        return;
+      }
+
+      setUserId(session.user.id);
+      setGoogleAccessToken(session.provider_token ?? null);
+      setIntegrationStatus({
+        supabase: "connected",
+        googleCalendar: session.provider_token ? "connected" : "not_connected"
+      });
+
+      await loadSupabaseData(session.user.id);
+
+      if (session.provider_token) {
+        await refreshCalendarEvents(session.provider_token);
+      }
+    }
+
+    void hydrateFromSupabase();
+
+    const {
+      data: { subscription }
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session) {
+        setUserId(null);
+        setGoogleAccessToken(null);
+        setIntegrationStatus({
+          supabase: "seeded",
+          googleCalendar: "not_connected"
+        });
+        return;
+      }
+
+      setUserId(session.user.id);
+      setGoogleAccessToken(session.provider_token ?? null);
+      setIntegrationStatus({
+        supabase: "connected",
+        googleCalendar: session.provider_token ? "connected" : "not_connected"
+      });
+      void loadSupabaseData(session.user.id);
+
+      if (session.provider_token) {
+        void refreshCalendarEvents(session.provider_token);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
+    // Auth/bootstrap should run once on mount; calendar refresh is invoked from
+    // the session callbacks with the current provider token.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function getCourse(courseId: string | null) {
     return (
-      seedData.courses.find((course) => course.id === courseId) ??
-      seedData.courses.find((course) => course.id === fallbackCourseId) ??
-      seedData.courses[0]
+      courses.find((course) => course.id === courseId) ??
+      courses.find((course) => course.id === fallbackCourseId) ??
+      courses[0]
+    );
+  }
+
+  async function loadSupabaseData(nextUserId: string) {
+    if (!supabase) {
+      return;
+    }
+
+    const [coursesResult, tasksResult] = await Promise.all([
+      supabase
+        .from("courses")
+        .select("id,name,color")
+        .eq("user_id", nextUserId)
+        .order("created_at", { ascending: true }),
+      supabase
+        .from("tasks")
+        .select(
+          "id,course_id,title,item_type,due_date,estimated_total_hours,estimated_hours,progress_percent,remaining_hours_override,weight,is_completed,google_event_id,created_at,updated_at"
+        )
+        .eq("user_id", nextUserId)
+        .order("due_date", { ascending: true })
+    ]);
+
+    if (coursesResult.data && coursesResult.data.length > 0) {
+      setCourses(coursesResult.data as Course[]);
+    }
+
+    if (tasksResult.data && tasksResult.data.length > 0) {
+      setTasks(tasksResult.data as Task[]);
+    }
+  }
+
+  async function persistTask(task: Task) {
+    if (!supabase || !userId) {
+      return;
+    }
+
+    await supabase.from("tasks").upsert({
+      ...task,
+      user_id: userId
+    });
+  }
+
+  async function removeTaskFromSupabase(taskId: string) {
+    if (!supabase || !userId) {
+      return;
+    }
+
+    await supabase.from("tasks").delete().eq("id", taskId).eq("user_id", userId);
+  }
+
+  async function refreshCalendarEvents(token = googleAccessToken) {
+    if (!token) {
+      setCalendarBlocks(seedData.calendarBlocks);
+      setIntegrationStatus((current) => ({
+        ...current,
+        googleCalendar: "not_connected"
+      }));
+      return;
+    }
+
+    try {
+      const params = new URLSearchParams({
+        timeMin: addDays(new Date(), -1).toISOString(),
+        timeMax: addDays(new Date(), 21).toISOString()
+      });
+      const response = await fetch(`/api/calendar/events?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (!response.ok) {
+        throw new Error("Unable to pull Google Calendar events.");
+      }
+
+      const payload = (await response.json()) as { blocks: CalendarBlock[] };
+      setCalendarBlocks([...seedData.calendarBlocks, ...payload.blocks]);
+      setIntegrationStatus((current) => ({
+        ...current,
+        googleCalendar: "connected"
+      }));
+      setSyncMessage("Google Calendar events refreshed.");
+    } catch {
+      setIntegrationStatus((current) => ({
+        ...current,
+        googleCalendar: "error"
+      }));
+      setSyncMessage("Calendar pull failed. FlowState kept your local data.");
+    }
+  }
+
+  async function syncDeadline(task: Task, action: "upsert" | "delete" = "upsert") {
+    if (!googleAccessToken) {
+      return task;
+    }
+
+    try {
+      const response = await fetch("/api/calendar/deadlines", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${googleAccessToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ task, action })
+      });
+
+      if (!response.ok) {
+        throw new Error("Unable to sync FlowState deadline.");
+      }
+
+      const payload = (await response.json()) as {
+        googleEventId?: string;
+        action: "upsert" | "delete";
+      };
+      const syncedTask =
+        payload.action === "delete"
+          ? { ...task, google_event_id: null }
+          : { ...task, google_event_id: payload.googleEventId ?? task.google_event_id };
+
+      setTasks((current) =>
+        current.map((currentTask) =>
+          currentTask.id === syncedTask.id ? syncedTask : currentTask
+        )
+      );
+      await persistTask(syncedTask);
+      setIntegrationStatus((current) => ({
+        ...current,
+        googleCalendar: "connected"
+      }));
+      setSyncMessage(
+        payload.action === "delete"
+          ? "Removed completed deadline from Google Calendar."
+          : "Synced deadline to Google Calendar."
+      );
+      return syncedTask;
+    } catch {
+      setIntegrationStatus((current) => ({
+        ...current,
+        googleCalendar: "error"
+      }));
+      setSyncMessage("Deadline sync failed, but your FlowState task was kept.");
+      return task;
+    }
+  }
+
+  async function signInWithGoogle() {
+    if (!supabase) {
+      setSyncMessage("Add Supabase environment variables to enable sign-in.");
+      return;
+    }
+
+    await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        scopes: googleCalendarScopes,
+        redirectTo: window.location.origin
+      }
+    });
+  }
+
+  async function signOut() {
+    if (!supabase) {
+      return;
+    }
+
+    await supabase.auth.signOut();
+    setTasks(seedData.tasks);
+    setCourses(seedData.courses);
+    setCalendarBlocks(seedData.calendarBlocks);
+    setIntegrationStatus(seedData.integrationStatus);
+    setSyncMessage("Signed out. Showing seeded demo data.");
+  }
+
+  async function manualSync() {
+    if (!googleAccessToken) {
+      setSyncMessage("Connect Google Calendar before syncing.");
+      return;
+    }
+
+    await refreshCalendarEvents(googleAccessToken);
+
+    const response = await fetch("/api/calendar/sync", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${googleAccessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ tasks: openTasks })
+    });
+
+    setSyncMessage(
+      response.ok
+        ? "Manual sync finished."
+        : "Manual sync had issues. Check Google Calendar permissions."
     );
   }
 
   function taskFromParsed(parsed: ParsedTask): Task {
     const matchedCourse = parsed.courseName
-      ? seedData.courses.find(
+      ? courses.find(
           (course) =>
             course.name.toLowerCase() === parsed.courseName?.toLowerCase()
         )
@@ -183,7 +484,7 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
         body: JSON.stringify({
           text,
           now: new Date().toISOString(),
-          courses: seedData.courses
+          courses
         })
       });
 
@@ -195,6 +496,8 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
       const nextTask = taskFromParsed(payload.parsed);
 
       setTasks((current) => [nextTask, ...current]);
+      await persistTask(nextTask);
+      void syncDeadline(nextTask);
       setParserState({
         confidence: payload.confidence,
         message:
@@ -203,10 +506,12 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
             : "Added with local fallback parsing."
       });
     } catch {
-      const parsed = parseTaskLocally(text, new Date(), seedData.courses);
+      const parsed = parseTaskLocally(text, new Date(), courses);
       const nextTask = taskFromParsed(parsed);
 
       setTasks((current) => [nextTask, ...current]);
+      await persistTask(nextTask);
+      void syncDeadline(nextTask);
       setParserState({
         confidence: "failed",
         message: "Parser failed, so FlowState used the local fallback."
@@ -215,59 +520,96 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
   }
 
   function completeTask(taskId: string) {
+    let nextTask: Task | null = null;
+
     setTasks((current) =>
-      current.map((task) =>
-        task.id === taskId
-          ? {
+      current.map((task) => {
+        if (task.id !== taskId) {
+          return task;
+        }
+
+        nextTask = {
               ...task,
               progress_percent: 100,
               remaining_hours_override: null,
               is_completed: true,
               updated_at: new Date().toISOString()
-            }
-          : task
-      )
+            };
+
+        return nextTask;
+      })
     );
+
+    if (nextTask) {
+      void persistTask(nextTask);
+      void syncDeadline(nextTask, "delete");
+    }
   }
 
   function snoozeTask(taskId: string) {
+    let nextTask: Task | null = null;
+
     setTasks((current) =>
-      current.map((task) =>
-        task.id === taskId
-          ? {
+      current.map((task) => {
+        if (task.id !== taskId) {
+          return task;
+        }
+
+        nextTask = {
               ...task,
               due_date: addDays(parseISO(task.due_date), 1).toISOString(),
               updated_at: new Date().toISOString()
-            }
-          : task
-      )
+            };
+
+        return nextTask;
+      })
     );
+
+    if (nextTask) {
+      void persistTask(nextTask);
+      void syncDeadline(nextTask);
+    }
   }
 
   function updateProgress(taskId: string, progress: number) {
     const nextProgress = clampProgress(progress);
+    let nextTask: Task | null = null;
 
     setTasks((current) =>
-      current.map((task) =>
-        task.id === taskId
-          ? {
+      current.map((task) => {
+        if (task.id !== taskId) {
+          return task;
+        }
+
+        nextTask = {
               ...task,
               progress_percent: nextProgress,
               remaining_hours_override:
                 nextProgress === 100 ? null : task.remaining_hours_override,
               is_completed: nextProgress === 100,
               updated_at: new Date().toISOString()
-            }
-          : task
-      )
+            };
+
+        return nextTask;
+      })
     );
+
+    if (nextTask) {
+      void persistTask(nextTask);
+      void syncDeadline(nextTask, nextProgress === 100 ? "delete" : "upsert");
+    }
   }
 
   function updateEstimate(taskId: string, delta: number) {
+    let nextTask: Task | null = null;
+
     setTasks((current) =>
-      current.map((task) =>
-        task.id === taskId
-          ? {
+      current.map((task) => {
+        if (task.id !== taskId) {
+          return task;
+        }
+
+        nextTask = {
               ...task,
               estimated_total_hours: Math.max(
                 0.5,
@@ -275,82 +617,173 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
               ),
               estimated_hours: Math.max(0.5, getTaskTotalHours(task) + delta),
               updated_at: new Date().toISOString()
-            }
-          : task
-      )
+            };
+
+        return nextTask;
+      })
     );
+
+    if (nextTask) {
+      void persistTask(nextTask);
+    }
   }
 
   function setRemainingOverride(taskId: string, remainingHours: number | null) {
+    let nextTask: Task | null = null;
+
     setTasks((current) =>
-      current.map((task) =>
-        task.id === taskId
-          ? {
+      current.map((task) => {
+        if (task.id !== taskId) {
+          return task;
+        }
+
+        nextTask = {
               ...task,
               remaining_hours_override:
                 remainingHours === null ? null : Math.max(0, remainingHours),
               updated_at: new Date().toISOString()
-            }
-          : task
-      )
+            };
+
+        return nextTask;
+      })
     );
+
+    if (nextTask) {
+      void persistTask(nextTask);
+    }
   }
 
   function deleteTask(taskId: string) {
+    const taskToDelete = tasks.find((task) => task.id === taskId);
+
     setTasks((current) => current.filter((task) => task.id !== taskId));
+
+    if (taskToDelete) {
+      void removeTaskFromSupabase(taskId);
+      void syncDeadline(taskToDelete, "delete");
+    }
   }
+
+  const taskQueue = (
+    <TaskQueue
+      courses={courses}
+      selectedCourseId={selectedCourseId}
+      activeTab={activeTab}
+      tasks={visibleTasks}
+      getCourse={getCourse}
+      onCourseChange={setSelectedCourseId}
+      onTabChange={setActiveTab}
+      onComplete={completeTask}
+      onSnooze={snoozeTask}
+      onEstimate={updateEstimate}
+      onProgress={updateProgress}
+      onDelete={deleteTask}
+      onOpenCommand={() => setIsCommandOpen(true)}
+    />
+  );
+
+  const focusPanel = (
+    <FocusPanel
+      task={focusTask}
+      getCourse={getCourse}
+      onComplete={completeTask}
+      onSnooze={snoozeTask}
+      onEstimate={updateEstimate}
+      onProgress={updateProgress}
+      onRemainingOverride={setRemainingOverride}
+      onOpenCommand={() => setIsCommandOpen(true)}
+    />
+  );
 
   return (
     <main className="min-h-screen pb-20 text-ink lg:pb-0">
       <div className="mx-auto grid min-h-screen max-w-[1680px] lg:grid-cols-[232px_minmax(0,1fr)]">
-        <Sidebar />
+        <Sidebar activeView={activeView} onViewChange={setActiveView} />
         <div className="min-w-0 px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
-          <TopBar onOpenCommand={() => setIsCommandOpen(true)} />
+          <TopBar
+            activeView={activeView}
+            onOpenCommand={() => setIsCommandOpen(true)}
+          />
 
-          <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(420px,1fr)_minmax(320px,0.8fr)] 2xl:grid-cols-[minmax(280px,0.75fr)_minmax(420px,1.25fr)_minmax(320px,0.8fr)]">
-            <div className="grid content-start gap-4 xl:col-span-2 2xl:col-span-1">
-              <StatsStrip tasks={openTasks} rankedTasks={rankedTasks} />
-              <CalendarTimeline
-                blocks={todayBlocks}
-                tasks={openTasks}
-                getCourse={getCourse}
-              />
-            </div>
+          {activeView === "today" ? (
+            <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(420px,1fr)_minmax(320px,0.8fr)] 2xl:grid-cols-[minmax(280px,0.75fr)_minmax(420px,1.25fr)_minmax(320px,0.8fr)]">
+              <div className="grid content-start gap-4 xl:col-span-2 2xl:col-span-1">
+                <StatsStrip tasks={openTasks} rankedTasks={rankedTasks} />
+                <CalendarTimeline
+                  blocks={todayBlocks}
+                  tasks={openTasks}
+                  getCourse={getCourse}
+                />
+              </div>
+              {taskQueue}
+              <div className="grid content-start gap-4">
+                {focusPanel}
+                <SettingsPanel
+                  status={integrationStatus}
+                  syncMessage={syncMessage}
+                  hasSupabase={Boolean(supabase)}
+                  hasGoogleToken={Boolean(googleAccessToken)}
+                  onGoogleSignIn={signInWithGoogle}
+                  onSignOut={signOut}
+                  onManualSync={manualSync}
+                />
+              </div>
+            </section>
+          ) : null}
 
-            <TaskQueue
-              courses={seedData.courses}
-              selectedCourseId={selectedCourseId}
-              activeTab={activeTab}
-              tasks={visibleTasks}
+          {activeView === "tasks" ? (
+            <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+              {taskQueue}
+              <div className="grid content-start gap-4">
+                <StatsStrip tasks={openTasks} rankedTasks={rankedTasks} />
+                {focusPanel}
+              </div>
+            </section>
+          ) : null}
+
+          {activeView === "calendar" ? (
+            <CalendarView
+              blocks={calendarBlocks}
+              tasks={openTasks}
               getCourse={getCourse}
-              onCourseChange={setSelectedCourseId}
-              onTabChange={setActiveTab}
-              onComplete={completeTask}
-              onSnooze={snoozeTask}
-              onEstimate={updateEstimate}
-              onProgress={updateProgress}
-              onDelete={deleteTask}
-              onOpenCommand={() => setIsCommandOpen(true)}
+              status={integrationStatus}
+              syncMessage={syncMessage}
+              hasGoogleToken={Boolean(googleAccessToken)}
+              onRefresh={() => void refreshCalendarEvents()}
+              onGoogleSignIn={signInWithGoogle}
+              onSignOut={signOut}
+              onManualSync={manualSync}
             />
+          ) : null}
 
-            <div className="grid content-start gap-4">
-              <FocusPanel
-                task={focusTask}
-                getCourse={getCourse}
-                onComplete={completeTask}
-                onSnooze={snoozeTask}
-                onEstimate={updateEstimate}
-                onProgress={updateProgress}
-                onRemainingOverride={setRemainingOverride}
-                onOpenCommand={() => setIsCommandOpen(true)}
+          {activeView === "courses" ? (
+            <CoursesView
+              courses={courses}
+              tasks={tasks}
+              onOpenTasks={(courseId) => {
+                setSelectedCourseId(courseId);
+                setActiveView("tasks");
+              }}
+            />
+          ) : null}
+
+          {activeView === "settings" ? (
+            <div className="mt-5 max-w-3xl">
+              <SettingsPanel
+                status={integrationStatus}
+                syncMessage={syncMessage}
+                hasSupabase={Boolean(supabase)}
+                hasGoogleToken={Boolean(googleAccessToken)}
+                onGoogleSignIn={signInWithGoogle}
+                onSignOut={signOut}
+                onManualSync={manualSync}
               />
-              <SettingsPanel status={seedData.integrationStatus} />
             </div>
-          </section>
+          ) : null}
         </div>
       </div>
 
-      <MobileNav />
+      <MobileNav activeView={activeView} onViewChange={setActiveView} />
       <CommandDialog
         open={isCommandOpen}
         parserState={parserState}
@@ -361,7 +794,13 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
   );
 }
 
-function Sidebar() {
+function Sidebar({
+  activeView,
+  onViewChange
+}: {
+  activeView: DashboardView;
+  onViewChange: (view: DashboardView) => void;
+}) {
   return (
     <aside className="hidden border-r border-white/80 bg-white/72 px-4 py-5 backdrop-blur lg:block">
       <div className="flex items-center gap-3 px-2">
@@ -375,16 +814,18 @@ function Sidebar() {
       </div>
 
       <nav className="mt-8 grid gap-1">
-        {navItems.map((item, index) => {
+        {navItems.map((item) => {
           const Icon = item.icon;
+          const active = item.value === activeView;
 
           return (
             <button
               key={item.label}
               type="button"
+              onClick={() => onViewChange(item.value)}
               className={cn(
                 "flex h-11 items-center gap-3 rounded-md px-3 text-sm font-semibold text-muted transition hover:bg-surface-muted hover:text-ink",
-                index === 0 && "bg-ink text-white hover:bg-ink hover:text-white"
+                active && "bg-ink text-white hover:bg-ink hover:text-white"
               )}
             >
               <Icon size={18} />
@@ -397,19 +838,27 @@ function Sidebar() {
   );
 }
 
-function MobileNav() {
+function MobileNav({
+  activeView,
+  onViewChange
+}: {
+  activeView: DashboardView;
+  onViewChange: (view: DashboardView) => void;
+}) {
   return (
     <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-5 border-t border-line bg-white/95 px-2 py-2 shadow-panel backdrop-blur lg:hidden">
-      {navItems.map((item, index) => {
+      {navItems.map((item) => {
         const Icon = item.icon;
+        const active = item.value === activeView;
 
         return (
           <button
             key={item.label}
             type="button"
+            onClick={() => onViewChange(item.value)}
             className={cn(
               "flex min-w-0 flex-col items-center gap-1 rounded-md px-1 py-1.5 text-[11px] font-semibold text-muted",
-              index === 0 && "bg-ink text-white"
+              active && "bg-ink text-white"
             )}
           >
             <Icon size={17} />
@@ -421,7 +870,13 @@ function MobileNav() {
   );
 }
 
-function TopBar({ onOpenCommand }: { onOpenCommand: () => void }) {
+function TopBar({
+  activeView,
+  onOpenCommand
+}: {
+  activeView: DashboardView;
+  onOpenCommand: () => void;
+}) {
   return (
     <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <div>
@@ -429,8 +884,9 @@ function TopBar({ onOpenCommand }: { onOpenCommand: () => void }) {
           {format(new Date(), "EEEE, MMMM d")}
         </p>
         <h1 className="mt-1 text-2xl font-semibold tracking-normal sm:text-3xl">
-          Today&apos;s academic priorities
+          {viewTitles[activeView]}
         </h1>
+        <p className="mt-1 text-sm text-muted">{viewSubtitles[activeView]}</p>
       </div>
       <button
         type="button"
@@ -1126,10 +1582,175 @@ function ProgressEditor({
   );
 }
 
+function CalendarView({
+  blocks,
+  tasks,
+  getCourse,
+  status,
+  syncMessage,
+  hasGoogleToken,
+  onRefresh,
+  onGoogleSignIn,
+  onSignOut,
+  onManualSync
+}: {
+  blocks: CalendarBlock[];
+  tasks: Task[];
+  getCourse: (courseId: string | null) => Course;
+  status: DashboardSeedData["integrationStatus"];
+  syncMessage: string | null;
+  hasGoogleToken: boolean;
+  onRefresh: () => void;
+  onGoogleSignIn: () => void;
+  onSignOut: () => void;
+  onManualSync: () => void;
+}) {
+  const mergedBlocks = [
+    ...blocks,
+    ...tasks.map(taskToDeadlineBlock)
+  ].sort((a, b) => parseISO(a.start).getTime() - parseISO(b.start).getTime());
+
+  return (
+    <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <Panel className="min-w-0">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase text-moss">
+              Master calendar
+            </p>
+            <h2 className="mt-1 text-xl font-semibold">
+              Google events and FlowState deadlines
+            </h2>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" size="sm" onClick={onRefresh}>
+              <RefreshCw size={15} />
+              Refresh
+            </Button>
+            <Button size="sm" onClick={onManualSync}>
+              <CalendarDays size={15} />
+              Sync deadlines
+            </Button>
+          </div>
+        </div>
+        <div className="grid gap-2">
+          {mergedBlocks.map((block) => {
+            const course = getCourse(block.course_id ?? null);
+
+            return (
+              <article
+                key={block.id}
+                className="grid grid-cols-[76px_minmax(0,1fr)_auto] items-center gap-3 rounded-md border border-line bg-white p-3"
+              >
+                <div className="text-xs font-semibold text-muted">
+                  <p>{format(parseISO(block.start), "MMM d")}</p>
+                  <p>{format(parseISO(block.start), "h:mm a")}</p>
+                </div>
+                <div className="min-w-0">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      className="h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: course.color }}
+                    />
+                    <h3 className="truncate text-sm font-semibold">
+                      {block.title}
+                    </h3>
+                  </div>
+                  <p className="mt-1 truncate text-xs text-muted">
+                    {block.is_readonly
+                      ? "Read-only Google Calendar event"
+                      : "FlowState deadline"}
+                  </p>
+                </div>
+                <Badge tone={block.kind === "deadline" ? "gold" : "neutral"}>
+                  {eventKindLabel(block.kind)}
+                </Badge>
+              </article>
+            );
+          })}
+          {mergedBlocks.length === 0 ? (
+            <EmptyState
+              title="No calendar items"
+              body="Connect Google Calendar or add deadlines to fill this view."
+            />
+          ) : null}
+        </div>
+      </Panel>
+      <SettingsPanel
+        status={status}
+        syncMessage={syncMessage}
+        hasSupabase={Boolean(supabase)}
+        hasGoogleToken={hasGoogleToken}
+        onGoogleSignIn={onGoogleSignIn}
+        onSignOut={onSignOut}
+        onManualSync={onManualSync}
+      />
+    </section>
+  );
+}
+
+function CoursesView({
+  courses,
+  tasks,
+  onOpenTasks
+}: {
+  courses: Course[];
+  tasks: Task[];
+  onOpenTasks: (courseId: string) => void;
+}) {
+  return (
+    <section className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+      {courses.map((course) => {
+        const courseTasks = tasks.filter((task) => task.course_id === course.id);
+        const open = courseTasks.filter((task) => !task.is_completed);
+        const effort = open.reduce(
+          (sum, task) => sum + getTaskRemainingHours(task),
+          0
+        );
+
+        return (
+          <Panel key={course.id}>
+            <div
+              className="mb-4 h-2 w-20 rounded-full"
+              style={{ backgroundColor: course.color }}
+            />
+            <h2 className="text-xl font-semibold">{course.name}</h2>
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              <Stat label="Open" value={String(open.length)} tone="ink" />
+              <Stat label="Done" value={String(courseTasks.length - open.length)} tone="sky" />
+              <Stat label="Effort" value={`${effort}h`} tone="coral" />
+            </div>
+            <Button
+              className="mt-4 w-full"
+              variant="secondary"
+              onClick={() => onOpenTasks(course.id)}
+            >
+              <ListChecks size={16} />
+              View tasks
+            </Button>
+          </Panel>
+        );
+      })}
+    </section>
+  );
+}
+
 function SettingsPanel({
-  status
+  status,
+  syncMessage,
+  hasSupabase,
+  hasGoogleToken,
+  onGoogleSignIn,
+  onSignOut,
+  onManualSync
 }: {
   status: DashboardSeedData["integrationStatus"];
+  syncMessage?: string | null;
+  hasSupabase?: boolean;
+  hasGoogleToken?: boolean;
+  onGoogleSignIn?: () => void;
+  onSignOut?: () => void;
+  onManualSync?: () => void;
 }) {
   return (
     <Panel>
@@ -1150,14 +1771,42 @@ function SettingsPanel({
         />
         <IntegrationRow
           label="Google Calendar"
-          status={
-            status.googleCalendar === "connected"
-              ? "Connected"
-              : "Not connected"
-          }
+          status={calendarStatusText[status.googleCalendar]}
           connected={status.googleCalendar === "connected"}
         />
       </div>
+      <div className="mt-4 grid gap-2">
+        <Button
+          variant={hasGoogleToken ? "secondary" : "primary"}
+          onClick={onGoogleSignIn}
+          disabled={!hasSupabase}
+        >
+          <LogIn size={16} />
+          {hasGoogleToken ? "Reconnect Google" : "Connect Google Calendar"}
+        </Button>
+        <Button variant="secondary" onClick={onManualSync} disabled={!hasGoogleToken}>
+          <RefreshCw size={16} />
+          Manual sync
+        </Button>
+        {hasSupabase ? (
+          <Button variant="ghost" onClick={onSignOut}>
+            Sign out
+          </Button>
+        ) : null}
+      </div>
+      {syncMessage ? (
+        <Badge
+          tone={status.googleCalendar === "error" ? "coral" : "sky"}
+          className="mt-4"
+        >
+          {syncMessage}
+        </Badge>
+      ) : null}
+      {!hasSupabase ? (
+        <p className="mt-3 text-sm text-muted">
+          Add Supabase environment variables to enable auth and live sync.
+        </p>
+      ) : null}
     </Panel>
   );
 }

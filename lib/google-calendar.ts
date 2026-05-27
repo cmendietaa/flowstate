@@ -7,10 +7,13 @@ export interface GoogleCalendarEvent {
   end: { date?: string; dateTime?: string };
 }
 
-export async function upsertDeadlineEvent(task: Task) {
+export async function upsertDeadlineEvent(task: Task, accessToken: string) {
   const response = await fetch("/api/calendar/deadlines", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json"
+    },
     body: JSON.stringify({ task })
   });
 

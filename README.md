@@ -26,6 +26,14 @@ GOOGLE_CLIENT_SECRET=
 
 `NEXT_PUBLIC_SUPABASE_ANON_KEY` is still accepted locally for older projects, but new Supabase projects should use `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY`.
 
+For Google Calendar sync, enable the Google provider in Supabase Auth and request:
+
+```text
+openid email profile https://www.googleapis.com/auth/calendar
+```
+
+Add your local and deployed site URLs to the Supabase redirect allow-list.
+
 ## Data
 
 The initial Supabase schema lives in `supabase/schema.sql`. It models `courses` and `tasks`, enables row level security, and intentionally does not persist `priority_score`; scores are calculated from current task state at read time.
@@ -33,5 +41,5 @@ The initial Supabase schema lives in `supabase/schema.sql`. It models `courses` 
 ## Current Integration Boundaries
 
 - `/api/parse-task` calls OpenAI structured outputs when `OPENAI_API_KEY` is present.
-- `/api/calendar/deadlines` is the Google Calendar sync boundary. It returns a configuration notice until OAuth token storage and secondary calendar selection are wired.
+- `/api/calendar/events`, `/api/calendar/deadlines`, and `/api/calendar/sync` use the Supabase Google provider token to pull events and sync FlowState deadlines.
 - The dashboard currently uses seeded local data so the product can be evaluated immediately.

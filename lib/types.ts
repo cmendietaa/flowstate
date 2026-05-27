@@ -16,6 +16,7 @@ export interface Task {
   remaining_hours_override: number | null;
   weight: number;
   is_completed: boolean;
+  google_event_id?: string | null;
   source?: "manual" | "llm" | "calendar";
   created_at?: string;
   updated_at?: string;
@@ -34,6 +35,9 @@ export interface CalendarBlock {
   end: string;
   course_id?: string | null;
   kind: "class" | "exam" | "personal" | "deadline";
+  external_id?: string;
+  calendar_id?: string;
+  is_readonly?: boolean;
 }
 
 export interface ParsedTask {
