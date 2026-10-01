@@ -17,7 +17,7 @@ export interface Task {
   weight: number;
   is_completed: boolean;
   google_event_id?: string | null;
-  source?: "manual" | "llm" | "calendar";
+  source?: "manual" | "llm" | "calendar" | "syllabus" | "canvas" | "gradescope" | "slack";
   created_at?: string;
   updated_at?: string;
 }
@@ -49,3 +49,29 @@ export interface ParsedTask {
 }
 
 export type ParserConfidence = "llm" | "fallback" | "failed";
+
+export type AcademicSource = "manual" | "llm" | "calendar" | "syllabus" | "canvas" | "gradescope" | "slack";
+
+export interface DetectedAcademicItem {
+  id: string;
+  source: Extract<AcademicSource, "syllabus" | "canvas" | "gradescope" | "slack">;
+  courseName: string;
+  title: string;
+  type: "assignment" | "quiz" | "exam" | "project" | "reading" | "task";
+  dueDate: string;
+  estimatedHours: number;
+  weight: "low" | "medium" | "high";
+  pointsPossible: number | null;
+  gradeCategory: string | null;
+  confidence: number;
+  rawSourceUrl?: string | null;
+}
+
+export interface DetectedGradeCategory {
+  id: string;
+  courseName: string;
+  name: string;
+  weightPercent: number;
+  source: Extract<AcademicSource, "syllabus" | "canvas" | "gradescope">;
+  confidence: number;
+}

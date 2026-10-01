@@ -8,9 +8,11 @@ import {
   Archive,
   CalendarDays,
   Check,
+  ClipboardCheck,
   ChevronDown,
   Clock3,
   Command,
+  FileText,
   Flag,
   Inbox,
   LayoutDashboard,
@@ -66,6 +68,8 @@ import { supabase } from "@/lib/supabase";
 import type {
   CalendarBlock,
   Course,
+  DetectedAcademicItem,
+  DetectedGradeCategory,
   ParsedTask,
   ParserConfidence,
   Task,
@@ -75,13 +79,20 @@ import type { DashboardSeedData } from "@/lib/data/tasks";
 import { cn } from "@/lib/utils";
 
 const fallbackCourseId = "inbox";
-type DashboardView = "today" | "tasks" | "calendar" | "courses" | "settings";
+type DashboardView =
+  | "today"
+  | "tasks"
+  | "calendar"
+  | "courses"
+  | "inbox"
+  | "settings";
 
 const navItems = [
   { value: "today", label: "Today", icon: LayoutDashboard },
   { value: "tasks", label: "Tasks", icon: ListChecks },
   { value: "calendar", label: "Calendar", icon: CalendarDays },
   { value: "courses", label: "Courses", icon: Inbox },
+  { value: "inbox", label: "Inbox", icon: ClipboardCheck },
   { value: "settings", label: "Settings", icon: Settings }
 ] satisfies { value: DashboardView; label: string; icon: typeof LayoutDashboard }[];
 
@@ -93,6 +104,7 @@ const viewTitles = {
   tasks: "Task queue",
   calendar: "Calendar sync",
   courses: "Courses",
+  inbox: "Review inbox",
   settings: "Settings"
 } satisfies Record<DashboardView, string>;
 
@@ -101,8 +113,40 @@ const viewSubtitles = {
   tasks: "Filter, adjust, and complete your ranked workload.",
   calendar: "Google Calendar blocks and FlowState deadlines together.",
   courses: "Course workload at a glance.",
+  inbox: "Detected assignments wait here before they touch your schedule.",
   settings: "Auth, data, and calendar connection status."
 } satisfies Record<DashboardView, string>;
+
+const initialDetectedAssignments: DetectedAcademicItem[] = [
+  {
+    id: "detected-syllabus-quiz",
+    source: "syllabus",
+    title: "Problem set 4",
+    courseName: "PSTAT 120A",
+    type: "assignment",
+    dueDate: addDays(new Date(), 6).toISOString(),
+    estimatedHours: 3,
+    weight: "medium",
+    pointsPossible: null,
+    gradeCategory: "Homework",
+    confidence: 0.72,
+    rawSourceUrl: null
+  },
+  {
+    id: "detected-gradescope-lab",
+    source: "gradescope",
+    title: "Calorimetry post-lab questions",
+    courseName: "CHEM 1A",
+    type: "assignment",
+    dueDate: addDays(new Date(), 3).toISOString(),
+    estimatedHours: 1.5,
+    weight: "low",
+    pointsPossible: null,
+    gradeCategory: "Gradescope",
+    confidence: 0.66,
+    rawSourceUrl: null
+  }
+];
 
 const calendarStatusText = {
   connected: "Connected",
@@ -123,6 +167,13 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
   const [activeView, setActiveView] = useState<DashboardView>("today");
   const [selectedCourseId, setSelectedCourseId] = useState("all");
   const [activeTab, setActiveTab] = useState("all");
+  const [calmMode, setCalmMode] = useState(false);
+  const [detectedAssignments, setDetectedAssignments] = useState(
+    initialDetectedAssignments
+  );
+  const [gradeCategories, setGradeCategories] = useState<DetectedGradeCategory[]>(
+    []
+  );
   const [isCommandOpen, setIsCommandOpen] = useState(false);
   const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
@@ -476,6 +527,31 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     };
   }
 
+  function taskFromDetected(item: DetectedAcademicItem): Task {
+    const matchedCourse =
+      courses.find(
+        (course) => course.name.toLowerCase() === item.courseName.toLowerCase()
+      ) ?? courses.find((course) => course.id === fallbackCourseId);
+    const now = new Date().toISOString();
+
+    return {
+      id: crypto.randomUUID(),
+      course_id: matchedCourse?.id ?? fallbackCourseId,
+      title: item.title,
+      item_type: item.type === "task" || item.type === "reading" ? "task" : "assignment",
+      due_date: item.dueDate,
+      estimated_total_hours: item.estimatedHours,
+      estimated_hours: item.estimatedHours,
+      progress_percent: 0,
+      remaining_hours_override: null,
+      weight: weightLabelToValue(item.weight),
+      is_completed: false,
+      source: item.source,
+      created_at: now,
+      updated_at: now
+    };
+  }
+
   async function createTask(text: string) {
     try {
       const response = await fetch("/api/parse-task", {
@@ -664,6 +740,113 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     }
   }
 
+  async function approveDetectedAssignment(itemId: string) {
+    const item = detectedAssignments.find((assignment) => assignment.id === itemId);
+
+    if (!item) {
+      return;
+    }
+
+    const nextTask = taskFromDetected(item);
+
+    setDetectedAssignments((current) =>
+      current.filter((assignment) => assignment.id !== itemId)
+    );
+    setTasks((current) => [nextTask, ...current]);
+    await persistTask(nextTask);
+    void syncDeadline(nextTask);
+  }
+
+  function rejectDetectedAssignment(itemId: string) {
+    setDetectedAssignments((current) =>
+      current.filter((assignment) => assignment.id !== itemId)
+    );
+  }
+
+  async function importSyllabus(text: string) {
+    const response = await fetch("/api/import/syllabus", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        now: new Date().toISOString(),
+        courses
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error("Syllabus import failed.");
+    }
+
+    const payload = (await response.json()) as {
+      items: DetectedAcademicItem[];
+      gradeCategories: DetectedGradeCategory[];
+      message: string;
+    };
+
+    setDetectedAssignments((current) => mergeDetectedItems(current, payload.items));
+    setGradeCategories((current) =>
+      mergeGradeCategories(current, payload.gradeCategories)
+    );
+    setSyncMessage(payload.message);
+  }
+
+  async function importCanvas(canvasBaseUrl: string, accessToken: string) {
+    const response = await fetch("/api/import/canvas", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        canvasBaseUrl,
+        accessToken,
+        courses
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error("Canvas import failed.");
+    }
+
+    const payload = (await response.json()) as {
+      items: DetectedAcademicItem[];
+      gradeCategories: DetectedGradeCategory[];
+      message: string;
+    };
+
+    setDetectedAssignments((current) => mergeDetectedItems(current, payload.items));
+    setGradeCategories((current) =>
+      mergeGradeCategories(current, payload.gradeCategories)
+    );
+    setSyncMessage(payload.message);
+  }
+
+  async function importGradescope(text: string) {
+    const response = await fetch("/api/import/gradescope", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text,
+        now: new Date().toISOString(),
+        courses
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error("Gradescope import failed.");
+    }
+
+    const payload = (await response.json()) as {
+      items: DetectedAcademicItem[];
+      gradeCategories: DetectedGradeCategory[];
+      message: string;
+    };
+
+    setDetectedAssignments((current) => mergeDetectedItems(current, payload.items));
+    setGradeCategories((current) =>
+      mergeGradeCategories(current, payload.gradeCategories)
+    );
+    setSyncMessage(payload.message);
+  }
+
   const taskQueue = (
     <TaskQueue
       courses={courses}
@@ -702,33 +885,25 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
         <div className="min-w-0 px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
           <TopBar
             activeView={activeView}
+            showQuickDrop={activeView !== "today"}
             onOpenCommand={() => setIsCommandOpen(true)}
           />
 
           {activeView === "today" ? (
-            <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(420px,1fr)_minmax(320px,0.8fr)] 2xl:grid-cols-[minmax(280px,0.75fr)_minmax(420px,1.25fr)_minmax(320px,0.8fr)]">
-              <div className="grid content-start gap-4 xl:col-span-2 2xl:col-span-1">
-                <StatsStrip tasks={openTasks} rankedTasks={rankedTasks} />
-                <CalendarTimeline
-                  blocks={todayBlocks}
-                  tasks={openTasks}
-                  getCourse={getCourse}
-                />
-              </div>
-              {taskQueue}
-              <div className="grid content-start gap-4">
-                {focusPanel}
-                <SettingsPanel
-                  status={integrationStatus}
-                  syncMessage={syncMessage}
-                  hasSupabase={Boolean(supabase)}
-                  hasGoogleToken={Boolean(googleAccessToken)}
-                  onGoogleSignIn={signInWithGoogle}
-                  onSignOut={signOut}
-                  onManualSync={manualSync}
-                />
-              </div>
-            </section>
+            <TodayView
+              focusTask={focusTask}
+              rankedTasks={rankedTasks}
+              openTasks={openTasks}
+              todayBlocks={todayBlocks}
+              calmMode={calmMode}
+              getCourse={getCourse}
+              onCalmModeChange={setCalmMode}
+              onComplete={completeTask}
+              onSnooze={snoozeTask}
+              onOpenCommand={() => setIsCommandOpen(true)}
+              onOpenTasks={() => setActiveView("tasks")}
+              onOpenCalendar={() => setActiveView("calendar")}
+            />
           ) : null}
 
           {activeView === "tasks" ? (
@@ -760,10 +935,24 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
             <CoursesView
               courses={courses}
               tasks={tasks}
+              gradeCategories={gradeCategories}
               onOpenTasks={(courseId) => {
                 setSelectedCourseId(courseId);
                 setActiveView("tasks");
               }}
+            />
+          ) : null}
+
+          {activeView === "inbox" ? (
+            <InboxView
+              detectedAssignments={detectedAssignments}
+              gradeCategories={gradeCategories}
+              courses={courses}
+              onImportSyllabus={importSyllabus}
+              onImportCanvas={importCanvas}
+              onImportGradescope={importGradescope}
+              onApprove={approveDetectedAssignment}
+              onReject={rejectDetectedAssignment}
             />
           ) : null}
 
@@ -846,7 +1035,7 @@ function MobileNav({
   onViewChange: (view: DashboardView) => void;
 }) {
   return (
-    <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-5 border-t border-line bg-white/95 px-2 py-2 shadow-panel backdrop-blur lg:hidden">
+    <nav className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-6 border-t border-line bg-white/95 px-2 py-2 shadow-panel backdrop-blur lg:hidden">
       {navItems.map((item) => {
         const Icon = item.icon;
         const active = item.value === activeView;
@@ -872,9 +1061,11 @@ function MobileNav({
 
 function TopBar({
   activeView,
+  showQuickDrop,
   onOpenCommand
 }: {
   activeView: DashboardView;
+  showQuickDrop: boolean;
   onOpenCommand: () => void;
 }) {
   return (
@@ -888,19 +1079,21 @@ function TopBar({
         </h1>
         <p className="mt-1 text-sm text-muted">{viewSubtitles[activeView]}</p>
       </div>
-      <button
-        type="button"
-        onClick={onOpenCommand}
-        className="flex h-12 items-center justify-between gap-3 rounded-md border border-line bg-white px-3 text-left text-sm text-muted shadow-soft transition hover:border-sky hover:text-ink sm:w-80"
-      >
-        <span className="flex min-w-0 items-center gap-2">
-          <Search size={17} />
-          <span className="truncate">Quick-drop assignment, exam, or task</span>
-        </span>
-        <span className="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs">
-          Cmd K
-        </span>
-      </button>
+      {showQuickDrop ? (
+        <button
+          type="button"
+          onClick={onOpenCommand}
+          className="flex h-12 items-center justify-between gap-3 rounded-md border border-line bg-white px-3 text-left text-sm text-muted shadow-soft transition hover:border-sky hover:text-ink sm:w-80"
+        >
+          <span className="flex min-w-0 items-center gap-2">
+            <Search size={17} />
+            <span className="truncate">Quick-drop assignment, exam, or task</span>
+          </span>
+          <span className="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs">
+            Cmd K
+          </span>
+        </button>
+      ) : null}
     </header>
   );
 }
@@ -940,6 +1133,254 @@ function StatsStrip({
         </Badge>
       )}
     </Panel>
+  );
+}
+
+function TodayView({
+  focusTask,
+  rankedTasks,
+  openTasks,
+  todayBlocks,
+  calmMode,
+  getCourse,
+  onCalmModeChange,
+  onComplete,
+  onSnooze,
+  onOpenCommand,
+  onOpenTasks,
+  onOpenCalendar
+}: {
+  focusTask: TaskWithPriority | undefined;
+  rankedTasks: TaskWithPriority[];
+  openTasks: Task[];
+  todayBlocks: CalendarBlock[];
+  calmMode: boolean;
+  getCourse: (courseId: string | null) => Course;
+  onCalmModeChange: (enabled: boolean) => void;
+  onComplete: (taskId: string) => void;
+  onSnooze: (taskId: string) => void;
+  onOpenCommand: () => void;
+  onOpenTasks: () => void;
+  onOpenCalendar: () => void;
+}) {
+  const nextTasks = rankedTasks.filter((task) => task.id !== focusTask?.id).slice(0, 3);
+  const todayDeadlines = openTasks
+    .filter((task) => isSameDay(parseISO(task.due_date), new Date()))
+    .map(taskToDeadlineBlock);
+  const schedulePreview = [...todayBlocks, ...todayDeadlines]
+    .sort((a, b) => parseISO(a.start).getTime() - parseISO(b.start).getTime())
+    .slice(0, 4);
+
+  return (
+    <section
+      className={cn(
+        "mt-5 grid gap-4",
+        calmMode
+          ? "mx-auto max-w-4xl"
+          : "xl:grid-cols-[minmax(0,1fr)_360px]"
+      )}
+    >
+      <Panel className="overflow-hidden bg-ink p-0 text-white">
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3 sm:px-5">
+          <div>
+            <p className="text-xs font-semibold uppercase text-white/52">
+              Now
+            </p>
+            <h2 className="mt-1 text-lg font-semibold">Next best move</h2>
+          </div>
+          <label className="flex cursor-pointer items-center gap-2 text-sm font-semibold text-white/72">
+            Calm
+            <input
+              type="checkbox"
+              checked={calmMode}
+              onChange={(event) => onCalmModeChange(event.target.checked)}
+              className="h-4 w-4 accent-sky"
+            />
+          </label>
+        </div>
+
+        {focusTask ? (
+          <div className="p-5 sm:p-7">
+            <div
+              className="mb-5 h-2 w-24 rounded-full"
+              style={{ backgroundColor: getCourse(focusTask.course_id).color }}
+            />
+            <p className="text-sm font-semibold text-white/62">
+              {getCourse(focusTask.course_id).name}
+            </p>
+            <h3 className="mt-3 max-w-3xl text-balance text-4xl font-semibold leading-tight sm:text-5xl">
+              {focusTask.title}
+            </h3>
+            <div className="mt-5 flex flex-wrap gap-2">
+              <Badge tone="neutral" className="bg-white/10 text-white/80">
+                <Clock3 size={13} />
+                Due {format(parseISO(focusTask.due_date), "EEE h:mm a")}
+              </Badge>
+              <Badge tone="neutral" className="bg-white/10 text-white/80">
+                <TimerReset size={13} />
+                {formatHours(getTaskRemainingHours(focusTask))} left
+              </Badge>
+            </div>
+            <div className="mt-8 grid gap-2 sm:grid-cols-[1fr_auto]">
+              <Button
+                variant="secondary"
+                size="lg"
+                className="bg-white text-ink hover:bg-white/90"
+                onClick={() => onComplete(focusTask.id)}
+              >
+                <Check size={20} />
+                Mark complete
+              </Button>
+              <Button
+                variant="ghost"
+                size="lg"
+                className="border border-white/12 bg-white/8 text-white hover:bg-white/14 hover:text-white"
+                onClick={() => onSnooze(focusTask.id)}
+              >
+                <Clock3 size={18} />
+                Snooze
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="p-5 sm:p-7">
+            <EmptyState
+              title="Nothing urgent right now"
+              body="Drop in an assignment when something appears."
+              inverse
+            />
+          </div>
+        )}
+      </Panel>
+
+      {!calmMode ? (
+        <div className="grid content-start gap-4">
+          <Panel>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase text-moss">
+                  Capture
+                </p>
+                <h2 className="mt-1 text-lg font-semibold">Quick input</h2>
+              </div>
+              <Command size={19} className="text-moss" />
+            </div>
+            <Button className="w-full" size="lg" onClick={onOpenCommand}>
+              <Plus size={18} />
+              Add assignment
+            </Button>
+          </Panel>
+
+          <Panel>
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase text-moss">
+                  Next up
+                </p>
+                <h2 className="mt-1 text-lg font-semibold">After this</h2>
+              </div>
+              <Button variant="ghost" size="sm" onClick={onOpenTasks}>
+                Tasks
+              </Button>
+            </div>
+            <div className="grid gap-2">
+              {nextTasks.map((task) => (
+                <CompactTask
+                  key={task.id}
+                  task={task}
+                  course={getCourse(task.course_id)}
+                />
+              ))}
+              {nextTasks.length === 0 ? (
+                <EmptyState
+                  title="Queue is quiet"
+                  body="Only the focus task needs attention."
+                />
+              ) : null}
+            </div>
+          </Panel>
+
+          <Panel>
+            <div className="mb-4 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase text-moss">
+                  Schedule
+                </p>
+                <h2 className="mt-1 text-lg font-semibold">Today</h2>
+              </div>
+              <Button variant="ghost" size="sm" onClick={onOpenCalendar}>
+                Calendar
+              </Button>
+            </div>
+            <div className="grid gap-2">
+              {schedulePreview.map((block) => (
+                <CompactCalendarBlock
+                  key={block.id}
+                  block={block}
+                  course={getCourse(block.course_id ?? null)}
+                />
+              ))}
+              {schedulePreview.length === 0 ? (
+                <EmptyState
+                  title="No blocks today"
+                  body="Your calendar is clear."
+                />
+              ) : null}
+            </div>
+          </Panel>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function CompactTask({
+  task,
+  course
+}: {
+  task: TaskWithPriority;
+  course: Course;
+}) {
+  return (
+    <article className="grid grid-cols-[5px_minmax(0,1fr)_auto] items-center gap-3 rounded-md border border-line bg-surface-muted/45 p-3">
+      <span
+        className="h-full min-h-12 rounded-full"
+        style={{ backgroundColor: course.color }}
+      />
+      <div className="min-w-0">
+        <h3 className="truncate text-sm font-semibold">{task.title}</h3>
+        <p className="mt-1 truncate text-xs text-muted">
+          {course.name} · {formatDistanceToNow(parseISO(task.due_date), { addSuffix: true })}
+        </p>
+      </div>
+      <Badge tone="neutral">{formatHours(getTaskRemainingHours(task))}</Badge>
+    </article>
+  );
+}
+
+function CompactCalendarBlock({
+  block,
+  course
+}: {
+  block: CalendarBlock;
+  course: Course;
+}) {
+  return (
+    <article className="grid grid-cols-[48px_minmax(0,1fr)] items-center gap-3 rounded-md border border-line bg-white p-3">
+      <p className="text-xs font-semibold text-muted">
+        {format(parseISO(block.start), "h:mm")}
+      </p>
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className="h-2.5 w-2.5 shrink-0 rounded-full"
+            style={{ backgroundColor: course.color }}
+          />
+          <h3 className="truncate text-sm font-semibold">{block.title}</h3>
+        </div>
+        <p className="mt-1 text-xs text-muted">{eventKindLabel(block.kind)}</p>
+      </div>
+    </article>
   );
 }
 
@@ -1689,13 +2130,297 @@ function CalendarView({
   );
 }
 
+function InboxView({
+  detectedAssignments,
+  gradeCategories,
+  courses,
+  onImportSyllabus,
+  onImportCanvas,
+  onImportGradescope,
+  onApprove,
+  onReject
+}: {
+  detectedAssignments: DetectedAcademicItem[];
+  gradeCategories: DetectedGradeCategory[];
+  courses: Course[];
+  onImportSyllabus: (text: string) => Promise<void>;
+  onImportCanvas: (canvasBaseUrl: string, accessToken: string) => Promise<void>;
+  onImportGradescope: (text: string) => Promise<void>;
+  onApprove: (itemId: string) => void;
+  onReject: (itemId: string) => void;
+}) {
+  return (
+    <section className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+      <Panel className="min-w-0">
+        <ImportSources
+          onImportSyllabus={onImportSyllabus}
+          onImportCanvas={onImportCanvas}
+          onImportGradescope={onImportGradescope}
+        />
+
+        <div className="mb-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase text-moss">
+              Review before scheduling
+            </p>
+            <h2 className="mt-1 text-xl font-semibold">Detected assignments</h2>
+          </div>
+          <Badge tone={detectedAssignments.length > 0 ? "gold" : "moss"}>
+            {detectedAssignments.length} waiting
+          </Badge>
+        </div>
+
+        <div className="grid gap-3">
+          {detectedAssignments.map((item) => {
+            const course =
+              courses.find((candidate) => candidate.name === item.courseName) ??
+              courses.find((candidate) => candidate.id === fallbackCourseId) ??
+              courses[0];
+
+            return (
+              <article
+                key={item.id}
+                className="grid gap-4 rounded-md border border-line bg-white p-4 sm:grid-cols-[minmax(0,1fr)_auto]"
+              >
+                <div className="min-w-0">
+                  <div className="mb-3 flex flex-wrap items-center gap-2">
+                    <Badge tone="sky">
+                      <FileText size={13} />
+                      {sourceLabel(item.source)}
+                    </Badge>
+                    <Badge tone="neutral">{item.weight} weight</Badge>
+                  </div>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span
+                      className="h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: course.color }}
+                    />
+                    <p className="truncate text-sm font-semibold text-muted">
+                      {item.courseName}
+                    </p>
+                  </div>
+                  <h3 className="mt-2 text-lg font-semibold">{item.title}</h3>
+                  <p className="mt-1 text-sm text-muted">
+                    Due {format(parseISO(item.dueDate), "EEE, MMM d h:mm a")} ·{" "}
+                    {item.estimatedHours}h estimate
+                  </p>
+                  {item.gradeCategory || item.pointsPossible ? (
+                    <p className="mt-1 text-xs text-muted">
+                      {item.gradeCategory ?? "Uncategorized"}
+                      {item.pointsPossible ? ` · ${item.pointsPossible} pts` : ""}
+                    </p>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-2 sm:flex-col sm:items-stretch">
+                  <Button onClick={() => onApprove(item.id)}>
+                    <Check size={16} />
+                    Add
+                  </Button>
+                  <Button variant="secondary" onClick={() => onReject(item.id)}>
+                    <X size={16} />
+                    Dismiss
+                  </Button>
+                </div>
+              </article>
+            );
+          })}
+
+          {detectedAssignments.length === 0 ? (
+            <EmptyState
+              title="Inbox is clear"
+              body="Detected syllabus, Canvas, and Gradescope items will wait here for approval."
+            />
+          ) : null}
+        </div>
+      </Panel>
+
+      <Panel>
+        <div className="mb-4 flex items-center gap-3">
+          <div className="flex h-10 w-10 items-center justify-center rounded-md bg-surface-muted text-moss">
+            <ClipboardCheck size={19} />
+          </div>
+          <div>
+            <p className="text-xs font-semibold uppercase text-moss">
+              Import policy
+            </p>
+            <h2 className="text-lg font-semibold">Nothing auto-schedules</h2>
+          </div>
+        </div>
+        <p className="text-sm leading-6 text-muted">
+          New assignments found in a syllabus or connected services land here
+          first. FlowState only adds them to your task queue and calendar after
+          you approve them.
+        </p>
+        {gradeCategories.length > 0 ? (
+          <div className="mt-4 rounded-md border border-line bg-surface-muted/45 p-3">
+            <p className="mb-2 text-xs font-semibold uppercase text-muted">
+              Imported grade weights
+            </p>
+            <div className="grid gap-2">
+              {gradeCategories.slice(0, 6).map((category) => (
+                <div
+                  key={category.id}
+                  className="flex items-center justify-between gap-3 text-sm"
+                >
+                  <span className="min-w-0 truncate">
+                    {category.courseName} · {category.name}
+                  </span>
+                  <Badge tone="gold">{category.weightPercent}%</Badge>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </Panel>
+    </section>
+  );
+}
+
+function ImportSources({
+  onImportSyllabus,
+  onImportCanvas,
+  onImportGradescope
+}: {
+  onImportSyllabus: (text: string) => Promise<void>;
+  onImportCanvas: (canvasBaseUrl: string, accessToken: string) => Promise<void>;
+  onImportGradescope: (text: string) => Promise<void>;
+}) {
+  const [syllabusText, setSyllabusText] = useState("");
+  const [canvasBaseUrl, setCanvasBaseUrl] = useState("");
+  const [canvasToken, setCanvasToken] = useState("");
+  const [gradescopeText, setGradescopeText] = useState("");
+  const [busySource, setBusySource] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function runImport(source: string, action: () => Promise<void>) {
+    setBusySource(source);
+    setError(null);
+
+    try {
+      await action();
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Import failed.");
+    } finally {
+      setBusySource(null);
+    }
+  }
+
+  async function handleSyllabusFile(file: File | undefined) {
+    if (!file) {
+      return;
+    }
+
+    setSyllabusText(await file.text());
+  }
+
+  return (
+    <div className="mb-6 grid gap-3">
+      <div>
+        <p className="text-xs font-semibold uppercase text-moss">
+          Import sources
+        </p>
+        <h2 className="mt-1 text-xl font-semibold">Bring coursework in</h2>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-3">
+        <div className="rounded-md border border-line bg-surface-muted/45 p-3">
+          <div className="mb-3 flex items-center gap-2">
+            <FileText size={17} className="text-moss" />
+            <h3 className="font-semibold">Syllabus</h3>
+          </div>
+          <input
+            type="file"
+            accept=".txt,.md,.csv"
+            onChange={(event) => void handleSyllabusFile(event.target.files?.[0])}
+            className="mb-2 block w-full text-xs text-muted"
+          />
+          <textarea
+            value={syllabusText}
+            onChange={(event) => setSyllabusText(event.target.value)}
+            placeholder="Paste syllabus schedule or grade weights..."
+            className="min-h-28 w-full rounded-md border border-line bg-white p-3 text-sm outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          />
+          <Button
+            className="mt-2 w-full"
+            size="sm"
+            disabled={!syllabusText.trim() || busySource === "syllabus"}
+            onClick={() =>
+              void runImport("syllabus", () => onImportSyllabus(syllabusText))
+            }
+          >
+            Extract syllabus
+          </Button>
+        </div>
+
+        <div className="rounded-md border border-line bg-surface-muted/45 p-3">
+          <div className="mb-3 flex items-center gap-2">
+            <Inbox size={17} className="text-moss" />
+            <h3 className="font-semibold">Canvas</h3>
+          </div>
+          <Input
+            value={canvasBaseUrl}
+            onChange={(event) => setCanvasBaseUrl(event.target.value)}
+            placeholder="https://school.instructure.com"
+            className="mb-2"
+          />
+          <Input
+            value={canvasToken}
+            onChange={(event) => setCanvasToken(event.target.value)}
+            placeholder="Canvas access token"
+            type="password"
+          />
+          <Button
+            className="mt-2 w-full"
+            size="sm"
+            disabled={!canvasBaseUrl.trim() || !canvasToken.trim() || busySource === "canvas"}
+            onClick={() =>
+              void runImport("canvas", () =>
+                onImportCanvas(canvasBaseUrl.trim(), canvasToken.trim())
+              )
+            }
+          >
+            Pull Canvas
+          </Button>
+        </div>
+
+        <div className="rounded-md border border-line bg-surface-muted/45 p-3">
+          <div className="mb-3 flex items-center gap-2">
+            <ClipboardCheck size={17} className="text-moss" />
+            <h3 className="font-semibold">Gradescope</h3>
+          </div>
+          <textarea
+            value={gradescopeText}
+            onChange={(event) => setGradescopeText(event.target.value)}
+            placeholder="Paste Gradescope assignment/export rows..."
+            className="min-h-28 w-full rounded-md border border-line bg-white p-3 text-sm outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+          />
+          <Button
+            className="mt-2 w-full"
+            size="sm"
+            disabled={!gradescopeText.trim() || busySource === "gradescope"}
+            onClick={() =>
+              void runImport("gradescope", () => onImportGradescope(gradescopeText))
+            }
+          >
+            Parse Gradescope
+          </Button>
+        </div>
+      </div>
+
+      {error ? <Badge tone="coral">{error}</Badge> : null}
+    </div>
+  );
+}
+
 function CoursesView({
   courses,
   tasks,
+  gradeCategories,
   onOpenTasks
 }: {
   courses: Course[];
   tasks: Task[];
+  gradeCategories: DetectedGradeCategory[];
   onOpenTasks: (courseId: string) => void;
 }) {
   return (
@@ -1706,6 +2431,9 @@ function CoursesView({
         const effort = open.reduce(
           (sum, task) => sum + getTaskRemainingHours(task),
           0
+        );
+        const categories = gradeCategories.filter(
+          (category) => category.courseName === course.name
         );
 
         return (
@@ -1720,6 +2448,28 @@ function CoursesView({
               <Stat label="Done" value={String(courseTasks.length - open.length)} tone="sky" />
               <Stat label="Effort" value={`${effort}h`} tone="coral" />
             </div>
+            {categories.length > 0 ? (
+              <div className="mt-4 rounded-md border border-line bg-surface-muted/45 p-3">
+                <p className="mb-2 text-xs font-semibold uppercase text-muted">
+                  Grade weights
+                </p>
+                <div className="grid gap-2">
+                  {categories.map((category) => (
+                    <div
+                      key={category.id}
+                      className="flex items-center justify-between gap-3 text-sm"
+                    >
+                      <span className="min-w-0 truncate">{category.name}</span>
+                      <Badge tone="gold">{category.weightPercent}%</Badge>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <p className="mt-4 rounded-md border border-dashed border-line bg-surface-muted/35 p-3 text-sm text-muted">
+                Import a syllabus or Canvas categories to calculate grades here.
+              </p>
+            )}
             <Button
               className="mt-4 w-full"
               variant="secondary"
@@ -1733,6 +2483,57 @@ function CoursesView({
       })}
     </section>
   );
+}
+
+function mergeDetectedItems(
+  current: DetectedAcademicItem[],
+  incoming: DetectedAcademicItem[]
+) {
+  const existing = new Set(current.map((item) => `${item.source}:${item.title}:${item.dueDate}`));
+  const additions = incoming.filter((item) => {
+    const key = `${item.source}:${item.title}:${item.dueDate}`;
+
+    if (existing.has(key)) {
+      return false;
+    }
+
+    existing.add(key);
+    return true;
+  });
+
+  return [...additions, ...current];
+}
+
+function mergeGradeCategories(
+  current: DetectedGradeCategory[],
+  incoming: DetectedGradeCategory[]
+) {
+  const existing = new Set(
+    current.map((category) => `${category.courseName}:${category.name}`)
+  );
+  const additions = incoming.filter((category) => {
+    const key = `${category.courseName}:${category.name}`;
+
+    if (existing.has(key)) {
+      return false;
+    }
+
+    existing.add(key);
+    return true;
+  });
+
+  return [...current, ...additions];
+}
+
+function sourceLabel(source: DetectedAcademicItem["source"]) {
+  const labels = {
+    syllabus: "Syllabus",
+    canvas: "Canvas",
+    gradescope: "Gradescope",
+    slack: "Slack"
+  };
+
+  return labels[source];
 }
 
 function SettingsPanel({
