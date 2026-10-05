@@ -49,6 +49,24 @@ export const detectedGradeCategorySchema = z.object({
   confidence: z.number().min(0).max(1)
 });
 
+export const detectedGradeSchema = z.object({
+  id: z.string(),
+  source: z.literal("canvas"),
+  courseName: z.string().min(1),
+  title: z.string().min(1),
+  earnedPoints: z.number().min(0),
+  pointsPossible: z.number().positive(),
+  gradeCategory: z.string().nullable(),
+  confidence: z.number().min(0).max(1)
+});
+
+export const gradeSnapshotResponseSchema = z.object({
+  grades: z.array(detectedGradeSchema),
+  gradeCategories: z.array(detectedGradeCategorySchema),
+  confidence: z.enum(["heuristic", "failed"]),
+  message: z.string()
+});
+
 export const academicImportResponseSchema = z.object({
   items: z.array(detectedAcademicItemSchema),
   gradeCategories: z.array(detectedGradeCategorySchema),

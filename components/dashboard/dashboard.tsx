@@ -69,6 +69,7 @@ import type {
   CalendarBlock,
   Course,
   DetectedAcademicItem,
+  DetectedGrade,
   DetectedGradeCategory,
   ParsedTask,
   ParserConfidence,
@@ -174,6 +175,7 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
   const [gradeCategories, setGradeCategories] = useState<DetectedGradeCategory[]>(
     []
   );
+  const [grades, setGrades] = useState<DetectedGrade[]>([]);
   const [isCommandOpen, setIsCommandOpen] = useState(false);
   const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
@@ -791,13 +793,12 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     setSyncMessage(payload.message);
   }
 
-  async function importCanvas(canvasBaseUrl: string, accessToken: string) {
-    const response = await fetch("/api/import/canvas", {
+  async function importCanvasFeed(feedUrl: string) {
+    const response = await fetch("/api/import/canvas-feed", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        canvasBaseUrl,
-        accessToken,
+        feedUrl,
         courses
       })
     });
@@ -845,6 +846,29 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
       mergeGradeCategories(current, payload.gradeCategories)
     );
     setSyncMessage(payload.message);
+  }
+
+  async function importCanvasGrades(text: string) {
+    const response = await fetch("/api/import/canvas-grades", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, courses })
+    });
+    const payload = (await response.json()) as {
+      grades?: DetectedGrade[];
+      gradeCategories?: DetectedGradeCategory[];
+      message?: string;
+    };
+
+    if (!response.ok) {
+      throw new Error(payload.message ?? "Canvas grade import failed.");
+    }
+
+    setGrades(payload.grades ?? []);
+    setGradeCategories((current) =>
+      mergeGradeCategories(current, payload.gradeCategories ?? [])
+    );
+    setSyncMessage(payload.message ?? "Canvas grades imported.");
   }
 
   const taskQueue = (
@@ -936,6 +960,7 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
               courses={courses}
               tasks={tasks}
               gradeCategories={gradeCategories}
+              grades={grades}
               onOpenTasks={(courseId) => {
                 setSelectedCourseId(courseId);
                 setActiveView("tasks");
@@ -949,7 +974,8 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
               gradeCategories={gradeCategories}
               courses={courses}
               onImportSyllabus={importSyllabus}
-              onImportCanvas={importCanvas}
+              onImportCanvas={importCanvasFeed}
+              onImportCanvasGrades={importCanvasGrades}
               onImportGradescope={importGradescope}
               onApprove={approveDetectedAssignment}
               onReject={rejectDetectedAssignment}
@@ -2136,6 +2162,7 @@ function InboxView({
   courses,
   onImportSyllabus,
   onImportCanvas,
+  onImportCanvasGrades,
   onImportGradescope,
   onApprove,
   onReject
@@ -2144,7 +2171,8 @@ function InboxView({
   gradeCategories: DetectedGradeCategory[];
   courses: Course[];
   onImportSyllabus: (text: string) => Promise<void>;
-  onImportCanvas: (canvasBaseUrl: string, accessToken: string) => Promise<void>;
+  onImportCanvas: (feedUrl: string) => Promise<void>;
+  onImportCanvasGrades: (text: string) => Promise<void>;
   onImportGradescope: (text: string) => Promise<void>;
   onApprove: (itemId: string) => void;
   onReject: (itemId: string) => void;
@@ -2155,6 +2183,7 @@ function InboxView({
         <ImportSources
           onImportSyllabus={onImportSyllabus}
           onImportCanvas={onImportCanvas}
+          onImportCanvasGrades={onImportCanvasGrades}
           onImportGradescope={onImportGradescope}
         />
 
@@ -2279,15 +2308,17 @@ function InboxView({
 function ImportSources({
   onImportSyllabus,
   onImportCanvas,
+  onImportCanvasGrades,
   onImportGradescope
 }: {
   onImportSyllabus: (text: string) => Promise<void>;
-  onImportCanvas: (canvasBaseUrl: string, accessToken: string) => Promise<void>;
+  onImportCanvas: (feedUrl: string) => Promise<void>;
+  onImportCanvasGrades: (text: string) => Promise<void>;
   onImportGradescope: (text: string) => Promise<void>;
 }) {
   const [syllabusText, setSyllabusText] = useState("");
-  const [canvasBaseUrl, setCanvasBaseUrl] = useState("");
-  const [canvasToken, setCanvasToken] = useState("");
+  const [canvasFeedUrl, setCanvasFeedUrl] = useState("");
+  const [canvasGradesText, setCanvasGradesText] = useState("");
   const [gradescopeText, setGradescopeText] = useState("");
   const [busySource, setBusySource] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -2357,29 +2388,25 @@ function ImportSources({
             <Inbox size={17} className="text-moss" />
             <h3 className="font-semibold">Canvas</h3>
           </div>
+          <p className="mb-2 text-xs leading-5 text-muted">
+            In Canvas, open Calendar &gt; Calendar Feed and paste the private feed link here.
+          </p>
           <Input
-            value={canvasBaseUrl}
-            onChange={(event) => setCanvasBaseUrl(event.target.value)}
-            placeholder="https://school.instructure.com"
-            className="mb-2"
-          />
-          <Input
-            value={canvasToken}
-            onChange={(event) => setCanvasToken(event.target.value)}
-            placeholder="Canvas access token"
-            type="password"
+            value={canvasFeedUrl}
+            onChange={(event) => setCanvasFeedUrl(event.target.value)}
+            placeholder="https://.../feeds/calendars/...ics"
           />
           <Button
             className="mt-2 w-full"
             size="sm"
-            disabled={!canvasBaseUrl.trim() || !canvasToken.trim() || busySource === "canvas"}
+            disabled={!canvasFeedUrl.trim() || busySource === "canvas"}
             onClick={() =>
               void runImport("canvas", () =>
-                onImportCanvas(canvasBaseUrl.trim(), canvasToken.trim())
+                onImportCanvas(canvasFeedUrl.trim())
               )
             }
           >
-            Pull Canvas
+            Pull Calendar Feed
           </Button>
         </div>
 
@@ -2407,6 +2434,36 @@ function ImportSources({
         </div>
       </div>
 
+      <div className="rounded-md border border-line bg-surface-muted/45 p-3">
+        <div className="mb-3 flex items-center gap-2">
+          <ClipboardCheck size={17} className="text-moss" />
+          <div>
+            <h3 className="font-semibold">Canvas grade snapshot</h3>
+            <p className="text-xs text-muted">
+              Copy the printable Grades table from Canvas.
+            </p>
+          </div>
+        </div>
+        <textarea
+          value={canvasGradesText}
+          onChange={(event) => setCanvasGradesText(event.target.value)}
+          placeholder="Paste Canvas grades, for example: Homework 1    9 / 10"
+          className="min-h-24 w-full rounded-md border border-line bg-white p-3 text-sm outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus"
+        />
+        <Button
+          className="mt-2"
+          size="sm"
+          disabled={!canvasGradesText.trim() || busySource === "canvas-grades"}
+          onClick={() =>
+            void runImport("canvas-grades", () =>
+              onImportCanvasGrades(canvasGradesText)
+            )
+          }
+        >
+          Import grade snapshot
+        </Button>
+      </div>
+
       {error ? <Badge tone="coral">{error}</Badge> : null}
     </div>
   );
@@ -2416,11 +2473,13 @@ function CoursesView({
   courses,
   tasks,
   gradeCategories,
+  grades,
   onOpenTasks
 }: {
   courses: Course[];
   tasks: Task[];
   gradeCategories: DetectedGradeCategory[];
+  grades: DetectedGrade[];
   onOpenTasks: (courseId: string) => void;
 }) {
   return (
@@ -2435,6 +2494,19 @@ function CoursesView({
         const categories = gradeCategories.filter(
           (category) => category.courseName === course.name
         );
+        const courseGrades = grades.filter(
+          (grade) => grade.courseName === course.name
+        );
+        const earned = courseGrades.reduce(
+          (sum, grade) => sum + grade.earnedPoints,
+          0
+        );
+        const possible = courseGrades.reduce(
+          (sum, grade) => sum + grade.pointsPossible,
+          0
+        );
+        const currentGrade =
+          possible > 0 ? Math.round((earned / possible) * 100) : null;
 
         return (
           <Panel key={course.id}>
@@ -2448,6 +2520,15 @@ function CoursesView({
               <Stat label="Done" value={String(courseTasks.length - open.length)} tone="sky" />
               <Stat label="Effort" value={`${effort}h`} tone="coral" />
             </div>
+            {currentGrade !== null ? (
+              <div className="mt-4 rounded-md border border-line bg-surface-muted/45 px-3 py-2">
+                <p className="text-xs uppercase text-muted">Points-based snapshot</p>
+                <p className="mt-1 text-2xl font-semibold text-ink">{currentGrade}%</p>
+                <p className="text-xs text-muted">
+                  Based on {courseGrades.length} graded items
+                </p>
+              </div>
+            ) : null}
             {categories.length > 0 ? (
               <div className="mt-4 rounded-md border border-line bg-surface-muted/45 p-3">
                 <p className="mb-2 text-xs font-semibold uppercase text-muted">

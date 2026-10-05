@@ -75,3 +75,14 @@ export interface DetectedGradeCategory {
   source: Extract<AcademicSource, "syllabus" | "canvas" | "gradescope">;
   confidence: number;
 }
+
+export interface DetectedGrade {
+  id: string;
+  source: "canvas";
+  courseName: string;
+  title: string;
+  earnedPoints: number;
+  pointsPossible: number;
+  gradeCategory: string | null;
+  confidence: number;
+}
