@@ -1,13 +1,33 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import type { Task } from "@/lib/types";
+import { calendarTaskSchema } from "@/lib/schemas/task";
 import { getAccessToken, upsertDeadlineEvent } from "@/lib/google-calendar-server";
 
 export async function POST(request: Request) {
-  const body = (await request.json()) as {
-    tasks: Task[];
-    accessToken?: string;
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return NextResponse.json(
+      { synced: false, reason: "Request body must be valid JSON.", results: [] },
+      { status: 400 }
+    );
+  }
+
+  const body = rawBody as {
+    tasks?: unknown;
   };
-  const accessToken = getAccessToken(request, body);
+  const parsedTasks = z.array(calendarTaskSchema).safeParse(body.tasks);
+
+  if (!parsedTasks.success) {
+    return NextResponse.json(
+      { synced: false, reason: "A valid tasks array is required.", results: [] },
+      { status: 400 }
+    );
+  }
+
+  const accessToken = getAccessToken(request);
 
   if (!accessToken) {
     return NextResponse.json(
@@ -20,7 +40,7 @@ export async function POST(request: Request) {
     );
   }
 
-  const openTasks = body.tasks.filter((task) => !task.is_completed);
+  const openTasks = parsedTasks.data.filter((task) => !task.is_completed) as Task[];
   const results = await Promise.allSettled(
     openTasks.map((task) => upsertDeadlineEvent(accessToken, task))
   );

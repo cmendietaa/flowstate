@@ -67,6 +67,14 @@ export const gradeSnapshotResponseSchema = z.object({
   message: z.string()
 });
 
+export const calendarTaskSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  due_date: z.string().datetime(),
+  is_completed: z.boolean(),
+  google_event_id: z.string().nullable().optional()
+});
+
 export const academicImportResponseSchema = z.object({
   items: z.array(detectedAcademicItemSchema),
   gradeCategories: z.array(detectedGradeCategorySchema),

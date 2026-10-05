@@ -9,6 +9,11 @@ interface GoogleCalendarListEntry {
   summary: string;
 }
 
+interface GooglePage<T> {
+  items?: T[];
+  nextPageToken?: string;
+}
+
 interface GoogleEventDate {
   date?: string;
   dateTime?: string;
@@ -59,14 +64,14 @@ function normalizeGoogleDate(date: GoogleEventDate | undefined) {
   return new Date(`${date.date}T00:00:00`).toISOString();
 }
 
-export function getAccessToken(request: Request, body?: { accessToken?: string }) {
+export function getAccessToken(request: Request) {
   const authHeader = request.headers.get("authorization");
 
   if (authHeader?.toLowerCase().startsWith("bearer ")) {
     return authHeader.slice("bearer ".length).trim();
   }
 
-  return body?.accessToken ?? null;
+  return null;
 }
 
 export function taskToGoogleEvent(task: Task) {
@@ -104,11 +109,8 @@ export function mapGoogleEventToBlock(
 }
 
 export async function getDeadlineCalendarId(accessToken: string) {
-  const calendars = await googleFetch<{ items?: GoogleCalendarListEntry[] }>(
-    accessToken,
-    "/users/me/calendarList"
-  );
-  const existing = calendars.items?.find(
+  const calendars = await listGoogleCalendars(accessToken);
+  const existing = calendars.find(
     (calendar) => calendar.summary === DEADLINES_CALENDAR_NAME
   );
 
@@ -136,33 +138,69 @@ export async function listGoogleCalendarBlocks({
   timeMin: string;
   timeMax: string;
 }) {
-  const calendars = await googleFetch<{ items?: GoogleCalendarListEntry[] }>(
-    accessToken,
-    "/users/me/calendarList"
-  );
+  const calendars = await listGoogleCalendars(accessToken);
   const readableCalendars =
-    calendars.items?.filter((calendar) => calendar.summary !== DEADLINES_CALENDAR_NAME) ??
-    [];
+    calendars.filter((calendar) => calendar.summary !== DEADLINES_CALENDAR_NAME);
   const blocks = await Promise.all(
     readableCalendars.map(async (calendar) => {
-      const params = new URLSearchParams({
-        singleEvents: "true",
-        orderBy: "startTime",
-        timeMin,
-        timeMax
-      });
-      const events = await googleFetch<{ items?: GoogleCalendarEvent[] }>(
-        accessToken,
-        `/calendars/${encodeURIComponent(calendar.id)}/events?${params.toString()}`
-      );
+      const events = await listGoogleEvents(accessToken, calendar.id, timeMin, timeMax);
 
-      return (events.items ?? []).map((event) =>
+      return events.map((event) =>
         mapGoogleEventToBlock(event, calendar.id)
       );
     })
   );
 
   return blocks.flat();
+}
+
+async function listGoogleCalendars(accessToken: string) {
+  const calendars: GoogleCalendarListEntry[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const params = new URLSearchParams();
+    if (pageToken) params.set("pageToken", pageToken);
+
+    const page = await googleFetch<GooglePage<GoogleCalendarListEntry>>(
+      accessToken,
+      `/users/me/calendarList${params.size ? `?${params.toString()}` : ""}`
+    );
+    calendars.push(...(page.items ?? []));
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+
+  return calendars;
+}
+
+async function listGoogleEvents(
+  accessToken: string,
+  calendarId: string,
+  timeMin: string,
+  timeMax: string
+) {
+  const events: GoogleCalendarEvent[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const params = new URLSearchParams({
+      singleEvents: "true",
+      orderBy: "startTime",
+      maxResults: "2500",
+      timeMin,
+      timeMax
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+
+    const page = await googleFetch<GooglePage<GoogleCalendarEvent>>(
+      accessToken,
+      `/calendars/${encodeURIComponent(calendarId)}/events?${params.toString()}`
+    );
+    events.push(...(page.items ?? []));
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+
+  return events;
 }
 
 export async function upsertDeadlineEvent(accessToken: string, task: Task) {

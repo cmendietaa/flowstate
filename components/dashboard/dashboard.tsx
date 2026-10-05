@@ -65,6 +65,8 @@ import {
 } from "@/lib/priority";
 import { parseTaskResponseSchema } from "@/lib/schemas/task";
 import { supabase } from "@/lib/supabase";
+import { calculateCourseGrade } from "@/lib/grades";
+import { mergeDetectedItems, mergeGradeCategories } from "@/lib/imports";
 import type {
   CalendarBlock,
   Course,
@@ -312,7 +314,7 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
       return;
     }
 
-    const [coursesResult, tasksResult] = await Promise.all([
+    const [coursesResult, tasksResult, categoriesResult, gradesResult] = await Promise.all([
       supabase
         .from("courses")
         .select("id,name,color")
@@ -324,16 +326,89 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
           "id,course_id,title,item_type,due_date,estimated_total_hours,estimated_hours,progress_percent,remaining_hours_override,weight,is_completed,google_event_id,created_at,updated_at"
         )
         .eq("user_id", nextUserId)
-        .order("due_date", { ascending: true })
+        .order("due_date", { ascending: true }),
+      supabase
+        .from("grade_categories")
+        .select("id,course_name,name,weight_percent,source,confidence")
+        .eq("user_id", nextUserId),
+      supabase
+        .from("grades")
+        .select(
+          "id,course_name,title,earned_points,points_possible,grade_category,source,confidence"
+        )
+        .eq("user_id", nextUserId)
     ]);
 
-    if (coursesResult.data && coursesResult.data.length > 0) {
+    if (coursesResult.data) {
       setCourses(coursesResult.data as Course[]);
     }
 
-    if (tasksResult.data && tasksResult.data.length > 0) {
+    if (tasksResult.data) {
       setTasks(tasksResult.data as Task[]);
     }
+
+    if (categoriesResult.data) {
+      setGradeCategories(
+        categoriesResult.data.map((category) => ({
+          id: category.id,
+          courseName: category.course_name,
+          name: category.name,
+          weightPercent: category.weight_percent,
+          source: category.source,
+          confidence: category.confidence
+        })) as DetectedGradeCategory[]
+      );
+    }
+
+    if (gradesResult.data) {
+      setGrades(
+        gradesResult.data.map((grade) => ({
+          id: grade.id,
+          source: grade.source,
+          courseName: grade.course_name,
+          title: grade.title,
+          earnedPoints: grade.earned_points,
+          pointsPossible: grade.points_possible,
+          gradeCategory: grade.grade_category,
+          confidence: grade.confidence
+        })) as DetectedGrade[]
+      );
+    }
+  }
+
+  async function persistAcademicData(
+    nextCategories: DetectedGradeCategory[],
+    nextGrades: DetectedGrade[]
+  ) {
+    if (!supabase || !userId) return;
+
+    await Promise.all([
+      supabase.from("grade_categories").upsert(
+        nextCategories.map((category) => ({
+          id: category.id,
+          user_id: userId,
+          course_name: category.courseName,
+          name: category.name,
+          weight_percent: category.weightPercent,
+          source: category.source,
+          confidence: category.confidence
+        }))
+      ),
+      supabase.from("grades").upsert(
+        nextGrades.map((grade) => ({
+          id: grade.id,
+          user_id: userId,
+          course_name: grade.courseName,
+          title: grade.title,
+          earned_points: grade.earnedPoints,
+          points_possible: grade.pointsPossible,
+          grade_category: grade.gradeCategory,
+          source: grade.source,
+          confidence: grade.confidence,
+          updated_at: new Date().toISOString()
+        }))
+      )
+    ]);
   }
 
   async function persistTask(task: Task) {
@@ -341,10 +416,29 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
       return;
     }
 
-    await supabase.from("tasks").upsert({
-      ...task,
-      user_id: userId
+    const { error } = await supabase.from("tasks").upsert({
+      id: task.id,
+      user_id: userId,
+      course_id: task.course_id === fallbackCourseId ? null : task.course_id,
+      title: task.title,
+      item_type: task.item_type,
+      due_date: task.due_date,
+      estimated_total_hours: task.estimated_total_hours,
+      estimated_hours: task.estimated_hours,
+      progress_percent: task.progress_percent,
+      remaining_hours_override: task.remaining_hours_override,
+      weight: task.weight,
+      is_completed: task.is_completed,
+      google_event_id: task.google_event_id ?? null,
+      updated_at: task.updated_at ?? new Date().toISOString()
     });
+
+    if (error) {
+      setSyncMessage("Task saved locally. Supabase could not save this change.");
+      return false;
+    }
+
+    return true;
   }
 
   async function removeTaskFromSupabase(taskId: string) {
@@ -379,7 +473,7 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
       }
 
       const payload = (await response.json()) as { blocks: CalendarBlock[] };
-      setCalendarBlocks([...seedData.calendarBlocks, ...payload.blocks]);
+      setCalendarBlocks(payload.blocks);
       setIntegrationStatus((current) => ({
         ...current,
         googleCalendar: "connected"
@@ -787,9 +881,9 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     };
 
     setDetectedAssignments((current) => mergeDetectedItems(current, payload.items));
-    setGradeCategories((current) =>
-      mergeGradeCategories(current, payload.gradeCategories)
-    );
+    const nextCategories = mergeGradeCategories(gradeCategories, payload.gradeCategories);
+    setGradeCategories(nextCategories);
+    void persistAcademicData(nextCategories, grades);
     setSyncMessage(payload.message);
   }
 
@@ -814,9 +908,9 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     };
 
     setDetectedAssignments((current) => mergeDetectedItems(current, payload.items));
-    setGradeCategories((current) =>
-      mergeGradeCategories(current, payload.gradeCategories)
-    );
+    const nextCategories = mergeGradeCategories(gradeCategories, payload.gradeCategories);
+    setGradeCategories(nextCategories);
+    void persistAcademicData(nextCategories, grades);
     setSyncMessage(payload.message);
   }
 
@@ -865,9 +959,14 @@ export function Dashboard({ seedData }: { seedData: DashboardSeedData }) {
     }
 
     setGrades(payload.grades ?? []);
-    setGradeCategories((current) =>
-      mergeGradeCategories(current, payload.gradeCategories ?? [])
+    const nextCategories = mergeGradeCategories(
+      gradeCategories,
+      payload.gradeCategories ?? []
     );
+    const nextGrades = payload.grades ?? [];
+    setGradeCategories(nextCategories);
+    setGrades(nextGrades);
+    void persistAcademicData(nextCategories, nextGrades);
     setSyncMessage(payload.message ?? "Canvas grades imported.");
   }
 
@@ -2497,16 +2596,7 @@ function CoursesView({
         const courseGrades = grades.filter(
           (grade) => grade.courseName === course.name
         );
-        const earned = courseGrades.reduce(
-          (sum, grade) => sum + grade.earnedPoints,
-          0
-        );
-        const possible = courseGrades.reduce(
-          (sum, grade) => sum + grade.pointsPossible,
-          0
-        );
-        const currentGrade =
-          possible > 0 ? Math.round((earned / possible) * 100) : null;
+        const gradeResult = calculateCourseGrade(courseGrades, categories);
 
         return (
           <Panel key={course.id}>
@@ -2520,12 +2610,18 @@ function CoursesView({
               <Stat label="Done" value={String(courseTasks.length - open.length)} tone="sky" />
               <Stat label="Effort" value={`${effort}h`} tone="coral" />
             </div>
-            {currentGrade !== null ? (
+            {gradeResult.percent !== null ? (
               <div className="mt-4 rounded-md border border-line bg-surface-muted/45 px-3 py-2">
-                <p className="text-xs uppercase text-muted">Points-based snapshot</p>
-                <p className="mt-1 text-2xl font-semibold text-ink">{currentGrade}%</p>
+                <p className="text-xs uppercase text-muted">
+                  {gradeResult.mode === "weighted"
+                    ? "Weighted grade snapshot"
+                    : "Points-based snapshot"}
+                </p>
+                <p className="mt-1 text-2xl font-semibold text-ink">
+                  {gradeResult.percent}%
+                </p>
                 <p className="text-xs text-muted">
-                  Based on {courseGrades.length} graded items
+                  Based on {gradeResult.gradedCount} graded items
                 </p>
               </div>
             ) : null}
@@ -2564,46 +2660,6 @@ function CoursesView({
       })}
     </section>
   );
-}
-
-function mergeDetectedItems(
-  current: DetectedAcademicItem[],
-  incoming: DetectedAcademicItem[]
-) {
-  const existing = new Set(current.map((item) => `${item.source}:${item.title}:${item.dueDate}`));
-  const additions = incoming.filter((item) => {
-    const key = `${item.source}:${item.title}:${item.dueDate}`;
-
-    if (existing.has(key)) {
-      return false;
-    }
-
-    existing.add(key);
-    return true;
-  });
-
-  return [...additions, ...current];
-}
-
-function mergeGradeCategories(
-  current: DetectedGradeCategory[],
-  incoming: DetectedGradeCategory[]
-) {
-  const existing = new Set(
-    current.map((category) => `${category.courseName}:${category.name}`)
-  );
-  const additions = incoming.filter((category) => {
-    const key = `${category.courseName}:${category.name}`;
-
-    if (existing.has(key)) {
-      return false;
-    }
-
-    existing.add(key);
-    return true;
-  });
-
-  return [...current, ...additions];
 }
 
 function sourceLabel(source: DetectedAcademicItem["source"]) {

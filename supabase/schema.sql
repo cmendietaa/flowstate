@@ -40,3 +40,41 @@ on public.tasks
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
+
+create table if not exists public.grade_categories (
+  id text primary key,
+  user_id uuid references auth.users(id) on delete cascade,
+  course_name text not null,
+  name text not null,
+  weight_percent double precision not null default 0,
+  source text not null check (source in ('syllabus', 'canvas', 'gradescope')),
+  confidence double precision not null default 0
+);
+
+create table if not exists public.grades (
+  id text primary key,
+  user_id uuid references auth.users(id) on delete cascade,
+  course_name text not null,
+  title text not null,
+  earned_points double precision not null default 0,
+  points_possible double precision not null,
+  grade_category text,
+  source text not null check (source = 'canvas'),
+  confidence double precision not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.grade_categories enable row level security;
+alter table public.grades enable row level security;
+
+create policy "Users can manage their grade categories"
+on public.grade_categories
+for all
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+create policy "Users can manage their grades"
+on public.grades
+for all
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);

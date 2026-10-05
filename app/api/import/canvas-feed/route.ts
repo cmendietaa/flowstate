@@ -67,7 +67,7 @@ function inferWeight(title: string): DetectedAcademicItem["weight"] {
       : "low";
 }
 
-function parseEvents(ics: string, courses: Course[]) {
+export function parseCanvasFeedEvents(ics: string, courses: Course[]) {
   const events: Array<Record<string, string>> = [];
   let current: Record<string, string> | null = null;
 
@@ -139,7 +139,7 @@ export async function POST(request: Request) {
 
     if (!response.ok) throw new Error("Canvas Calendar Feed request failed: " + response.status);
 
-    const items = parseEvents(await response.text(), courses.data);
+    const items = parseCanvasFeedEvents(await response.text(), courses.data);
     return NextResponse.json(
       academicImportResponseSchema.parse({
         items,
