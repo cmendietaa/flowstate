@@ -29,12 +29,14 @@ create table if not exists public.tasks (
 alter table public.courses enable row level security;
 alter table public.tasks enable row level security;
 
+drop policy if exists "Users can manage their courses" on public.courses;
 create policy "Users can manage their courses"
 on public.courses
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
 
+drop policy if exists "Users can manage their tasks" on public.tasks;
 create policy "Users can manage their tasks"
 on public.tasks
 for all
@@ -67,12 +69,14 @@ create table if not exists public.grades (
 alter table public.grade_categories enable row level security;
 alter table public.grades enable row level security;
 
+drop policy if exists "Users can manage their grade categories" on public.grade_categories;
 create policy "Users can manage their grade categories"
 on public.grade_categories
 for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
 
+drop policy if exists "Users can manage their grades" on public.grades;
 create policy "Users can manage their grades"
 on public.grades
 for all
